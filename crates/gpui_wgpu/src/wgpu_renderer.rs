@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
-    pad: u32,
+    max_order: f32,
 }
 
 #[repr(C)]
@@ -57,7 +57,74 @@ struct GammaParams {
 #[derive(Clone, Debug)]
 #[repr(C)]
 struct PathSprite {
+    order: u32,
+    pad: u32,
     bounds: Bounds<ScaledPixels>,
+}
+
+/// Depth buffer format used by the opaque depth pre-pass and the depth-tested
+/// main pass.
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Returns the quads eligible for the opaque depth pre-pass, sorted front-to-back.
+fn collect_opaque_quads(scene: &Scene) -> Vec<Quad> {
+    let mut quads: Vec<Quad> = scene
+        .quads
+        .iter()
+        .filter(|quad| is_opaque_quad(quad))
+        .copied()
+        .collect();
+    quads.sort_by_key(|quad| std::cmp::Reverse(quad.order));
+    quads
+}
+
+/// A quad qualifies for the depth pre-pass only if it covers its rect with fully
+/// opaque pixels and isn't clipped (the pre-pass has no fragment shader to clip
+/// or antialias).
+fn is_opaque_quad(quad: &Quad) -> bool {
+    let solid_opaque = quad
+        .background
+        .as_solid()
+        .is_some_and(|color| color.is_opaque());
+    if !solid_opaque {
+        return false;
+    }
+
+    let unrounded = quad.corner_radii.top_left.0 == 0.0
+        && quad.corner_radii.top_right.0 == 0.0
+        && quad.corner_radii.bottom_left.0 == 0.0
+        && quad.corner_radii.bottom_right.0 == 0.0;
+    let unbordered = quad.border_widths.top.0 == 0.0
+        && quad.border_widths.right.0 == 0.0
+        && quad.border_widths.bottom.0 == 0.0
+        && quad.border_widths.left.0 == 0.0;
+
+    let mask = quad.content_mask.bounds;
+    let bounds = quad.bounds;
+    let unclipped = mask.origin.x.0 <= bounds.origin.x.0
+        && mask.origin.y.0 <= bounds.origin.y.0
+        && mask.origin.x.0 + mask.size.width.0 >= bounds.origin.x.0 + bounds.size.width.0
+        && mask.origin.y.0 + mask.size.height.0 >= bounds.origin.y.0 + bounds.size.height.0;
+
+    unrounded && unbordered && unclipped
+}
+
+/// The highest draw order in the scene. Primitive vectors are sorted by order in
+/// `Scene::finish`, so each type's maximum is its last element.
+fn scene_max_order(scene: &Scene) -> u32 {
+    [
+        scene.quads.last().map(|p| p.order),
+        scene.shadows.last().map(|p| p.order),
+        scene.paths.last().map(|p| p.order),
+        scene.underlines.last().map(|p| p.order),
+        scene.monochrome_sprites.last().map(|p| p.order),
+        scene.subpixel_sprites.last().map(|p| p.order),
+        scene.polychrome_sprites.last().map(|p| p.order),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(0)
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +150,8 @@ pub struct WgpuSurfaceConfig {
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
+    /// Depth-only pipeline that writes the opaque depth pre-pass.
+    opaque_quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
@@ -120,6 +189,7 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    depth_texture: Option<wgpu::Texture>,
 }
 
 impl WgpuResources {
@@ -128,6 +198,7 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.depth_texture = None;
     }
 }
 
@@ -463,6 +534,7 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            depth_texture: None,
         };
 
         Ok(Self {
@@ -677,55 +749,68 @@ impl WgpuRenderer {
             write_mask: wgpu::ColorWrites::ALL,
         };
 
-        let create_pipeline = |name: &str,
-                               vs_entry: &str,
-                               fs_entry: &str,
-                               globals_layout: &wgpu::BindGroupLayout,
-                               data_layout: &wgpu::BindGroupLayout,
-                               topology: wgpu::PrimitiveTopology,
-                               color_targets: &[Option<wgpu::ColorTargetState>],
-                               sample_count: u32,
-                               module: &wgpu::ShaderModule| {
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(&format!("{name}_layout")),
-                bind_group_layouts: &[Some(globals_layout), Some(data_layout)],
-                immediate_size: 0,
-            });
-
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some(vs_entry),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some(fs_entry),
-                    targets: color_targets,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: None,
-            })
+        // Main-pass primitives test (but never write) depth so fragments hidden
+        // behind opaque quads from the depth pre-pass are rejected early.
+        let depth_test = wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
         };
+
+        let create_pipeline =
+            |name: &str,
+             vs_entry: &str,
+             fs_entry: &str,
+             globals_layout: &wgpu::BindGroupLayout,
+             data_layout: &wgpu::BindGroupLayout,
+             topology: wgpu::PrimitiveTopology,
+             color_targets: &[Option<wgpu::ColorTargetState>],
+             sample_count: u32,
+             module: &wgpu::ShaderModule,
+             depth_stencil: Option<wgpu::DepthStencilState>| {
+                let pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some(&format!("{name}_layout")),
+                        bind_group_layouts: &[Some(globals_layout), Some(data_layout)],
+                        immediate_size: 0,
+                    });
+
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(name),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module,
+                        entry_point: Some(vs_entry),
+                        buffers: &[],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module,
+                        entry_point: Some(fs_entry),
+                        targets: color_targets,
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil,
+                    multisample: wgpu::MultisampleState {
+                        count: sample_count,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
 
         let quads = create_pipeline(
             "quads",
@@ -737,7 +822,64 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
+            Some(depth_test.clone()),
         );
+
+        // Depth-only pre-pass: fully-opaque, unrounded, unbordered, unclipped
+        // quads write depth (front-to-back) so the main pass can reject hidden
+        // fragments. No color output.
+        let opaque_quads = {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("opaque_quads_layout"),
+                bind_group_layouts: &[Some(&layouts.globals), Some(&layouts.instances)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("opaque_quads"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_quad"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                // The fragment writes no color (empty write mask); it exists only
+                // so the pipeline's color target matches the main render pass.
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module,
+                    entry_point: Some("fs_quad_depth"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::empty(),
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
 
         let shadows = create_pipeline(
             "shadows",
@@ -749,6 +891,7 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
+            Some(depth_test.clone()),
         );
 
         let path_rasterization = create_pipeline(
@@ -765,6 +908,7 @@ impl WgpuRenderer {
             })],
             path_sample_count,
             &shader_module,
+            None,
         );
 
         let paths_blend = wgpu::BlendState {
@@ -794,6 +938,7 @@ impl WgpuRenderer {
             })],
             1,
             &shader_module,
+            Some(depth_test.clone()),
         );
 
         let underlines = create_pipeline(
@@ -806,6 +951,7 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
+            Some(depth_test.clone()),
         );
 
         let mono_sprites = create_pipeline(
@@ -818,6 +964,7 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
+            Some(depth_test.clone()),
         );
 
         let subpixel_sprites = if let Some(subpixel_module) = &subpixel_shader_module {
@@ -848,6 +995,7 @@ impl WgpuRenderer {
                 })],
                 1,
                 subpixel_module,
+                Some(depth_test.clone()),
             ))
         } else {
             None
@@ -863,6 +1011,7 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
+            Some(depth_test.clone()),
         );
 
         let surfaces = create_pipeline(
@@ -875,10 +1024,12 @@ impl WgpuRenderer {
             &[Some(color_target)],
             1,
             &shader_module,
+            Some(depth_test),
         );
 
         WgpuPipelines {
             quads,
+            opaque_quads,
             shadows,
             path_rasterization,
             paths,
@@ -912,6 +1063,23 @@ impl WgpuRenderer {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         (texture, view)
+    }
+
+    fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
     }
 
     fn create_msaa_if_needed(
@@ -979,6 +1147,9 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.path_msaa_texture {
                 texture.destroy();
             }
+            if let Some(ref texture) = resources.depth_texture {
+                texture.destroy();
+            }
 
             resources
                 .surface
@@ -1017,6 +1188,9 @@ impl WgpuRenderer {
         .unwrap_or((None, None));
         resources.path_msaa_texture = path_msaa_texture;
         resources.path_msaa_view = path_msaa_view;
+
+        let depth_texture = Self::create_depth_texture(&resources.device, width, height);
+        resources.depth_texture = Some(depth_texture);
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1159,6 +1333,10 @@ impl WgpuRenderer {
             _pad: 0,
         };
 
+        // Quads eligible for the opaque depth pre-pass, sorted front-to-back so
+        // hidden fragments are rejected by the depth test instead of overdrawn.
+        let opaque_quads = collect_opaque_quads(scene);
+
         let globals = GlobalParams {
             viewport_size: [
                 self.surface_config.width as f32,
@@ -1171,7 +1349,7 @@ impl WgpuRenderer {
             } else {
                 0
             },
-            pad: 0,
+            max_order: scene_max_order(scene) as f32,
         };
 
         let path_globals = GlobalParams {
@@ -1198,6 +1376,13 @@ impl WgpuRenderer {
             );
         }
 
+        let depth_view = self
+            .resources()
+            .depth_texture
+            .as_ref()
+            .expect("depth texture not available")
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
@@ -1221,11 +1406,34 @@ impl WgpuRenderer {
                         },
                         depth_slice: None,
                     })],
-                    depth_stencil_attachment: None,
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
                     ..Default::default()
                 });
 
+                // Opaque depth pre-pass: write depth for opaque quads only.
+                if !opaque_quads.is_empty()
+                    && !self.draw_instances(
+                        unsafe { Self::instance_bytes(&opaque_quads) },
+                        opaque_quads.len() as u32,
+                        &self.resources().pipelines.opaque_quads,
+                        &mut instance_offset,
+                        &mut pass,
+                    )
+                {
+                    overflow = true;
+                }
+
                 for batch in scene.batches() {
+                    if overflow {
+                        break;
+                    }
                     let ok = match batch {
                         PrimitiveBatch::Quads(range) => {
                             self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
@@ -1260,7 +1468,16 @@ impl WgpuRenderer {
                                     },
                                     depth_slice: None,
                                 })],
-                                depth_stencil_attachment: None,
+                                depth_stencil_attachment: Some(
+                                    wgpu::RenderPassDepthStencilAttachment {
+                                        view: &depth_view,
+                                        depth_ops: Some(wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        }),
+                                        stencil_ops: None,
+                                    },
+                                ),
                                 ..Default::default()
                             });
 
@@ -1542,6 +1759,8 @@ impl WgpuRenderer {
             paths
                 .iter()
                 .map(|p| PathSprite {
+                    order: p.order,
+                    pad: 0,
                     bounds: p.clipped_bounds(),
                 })
                 .collect()
@@ -1550,7 +1769,14 @@ impl WgpuRenderer {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
+            // Paths with differing orders are merged into one composite sprite;
+            // use the frontmost order so it isn't wrongly depth-culled.
+            let order = paths.last().map_or(first_path.order, |p| p.order);
+            vec![PathSprite {
+                order,
+                pad: 0,
+                bounds,
+            }]
         };
 
         let resources = self.resources();
