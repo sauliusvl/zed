@@ -1396,36 +1396,49 @@ impl Element for TerminalElement {
                         }
                     });
 
-                    for rect in &layout.rects {
-                        rect.paint(origin, &layout.dimensions, window);
-                    }
-
-                    for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
-                        if let Some((start_y, highlighted_range_lines)) =
-                            to_highlighted_range_lines(relative_highlighted_range, layout, origin)
-                        {
-                            let corner_radius = if EditorSettings::get_global(cx).rounded_selection
-                            {
-                                0.15 * layout.dimensions.line_height
-                            } else {
-                                Pixels::ZERO
-                            };
-                            let hr = HighlightedRange {
-                                start_y,
-                                line_height: layout.dimensions.line_height,
-                                lines: highlighted_range_lines,
-                                color: *color,
-                                corner_radius: corner_radius,
-                            };
-                            hr.paint(true, bounds, window);
-                        }
-                    }
-
-                    // Paint batched text runs instead of individual cells
+                    // Grid cells don't overlap, so paint them all in a single scene
+                    // layer: one draw order for the whole grid instead of a
+                    // bounds-tree insertion per primitive. Stacking within the layer
+                    // is preserved by primitive kind (quads < paths < underlines <
+                    // glyph sprites), matching how the editor paints its text.
                     let text_paint_start = Instant::now();
-                    for batch in &layout.batched_text_runs {
-                        batch.paint(origin, &layout.dimensions, window, cx);
-                    }
+                    window.paint_layer(bounds, |window| {
+                        for rect in &layout.rects {
+                            rect.paint(origin, &layout.dimensions, window);
+                        }
+
+                        for (relative_highlighted_range, color) in
+                            &layout.relative_highlighted_ranges
+                        {
+                            if let Some((start_y, highlighted_range_lines)) =
+                                to_highlighted_range_lines(
+                                    relative_highlighted_range,
+                                    layout,
+                                    origin,
+                                )
+                            {
+                                let corner_radius =
+                                    if EditorSettings::get_global(cx).rounded_selection {
+                                        0.15 * layout.dimensions.line_height
+                                    } else {
+                                        Pixels::ZERO
+                                    };
+                                let hr = HighlightedRange {
+                                    start_y,
+                                    line_height: layout.dimensions.line_height,
+                                    lines: highlighted_range_lines,
+                                    color: *color,
+                                    corner_radius: corner_radius,
+                                };
+                                hr.paint(true, bounds, window);
+                            }
+                        }
+
+                        // Paint batched text runs instead of individual cells
+                        for batch in &layout.batched_text_runs {
+                            batch.paint(origin, &layout.dimensions, window, cx);
+                        }
+                    });
                     let text_paint_time = text_paint_start.elapsed();
 
                     if let Some(text_to_mark) = &marked_text_cloned

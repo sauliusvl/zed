@@ -2096,20 +2096,34 @@ impl Terminal {
                 if let Some(bytes) = bytes {
                     self.write_to_pty(bytes);
                 }
+                cx.notify();
             }
         } else {
-            self.schedule_find_hyperlink(e.modifiers, e.position);
+            let had_hovered_word = self.last_content.last_hovered_word.is_some();
+            let scheduled_search = self.schedule_find_hyperlink(e.modifiers, e.position);
+            let cleared_hovered_word =
+                had_hovered_word && self.last_content.last_hovered_word.is_none();
+            // Plain pointer movement over the terminal requires no redraw: only
+            // notify when a hyperlink search was scheduled (it is processed during
+            // the next sync) or hover state visibly changed.
+            if scheduled_search || cleared_hovered_word {
+                cx.notify();
+            }
         }
-        cx.notify();
     }
 
-    fn schedule_find_hyperlink(&mut self, modifiers: Modifiers, position: GpuiPoint<Pixels>) {
+    /// Returns whether a hyperlink search was scheduled.
+    fn schedule_find_hyperlink(
+        &mut self,
+        modifiers: Modifiers,
+        position: GpuiPoint<Pixels>,
+    ) -> bool {
         if self.selection_phase == SelectionPhase::Selecting
             || !modifiers.secondary()
             || !self.last_content.terminal_bounds.bounds.contains(&position)
         {
             self.last_content.last_hovered_word = None;
-            return;
+            return false;
         }
 
         // Throttle hyperlink searches to avoid excessive processing
@@ -2131,6 +2145,9 @@ impl Terminal {
                 position - self.last_content.terminal_bounds.bounds.origin,
                 false,
             ));
+            true
+        } else {
+            false
         }
     }
 
