@@ -1011,6 +1011,8 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    /// Damage computed for the most recent draw, consumed by `present`.
+    render_damage: Option<crate::SceneDamage>,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -1707,6 +1709,7 @@ impl Window {
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            render_damage: None,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -2656,7 +2659,18 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
+        // Drop primitives hidden behind opaque quads before sorting and diffing,
+        // so every backend skips them without GPU-side occlusion machinery.
+        if crate::scene_damage::occlusion_cull_enabled() {
+            self.next_frame.scene.cull_occluded();
+        }
         self.next_frame.finish(&mut self.rendered_frame);
+
+        // Diff the new frame against the previous one while both still exist,
+        // so the renderer can redraw only the changed region.
+        self.render_damage = self.platform_window.wants_render_damage().then(|| {
+            crate::SceneDamage::between(&self.rendered_frame.scene, &self.next_frame.scene)
+        });
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -2736,7 +2750,14 @@ impl Window {
 
     #[profiling::function]
     fn present(&mut self) {
-        self.platform_window.draw(&self.rendered_frame.scene);
+        // Presentation-only frames (no new draw) re-present an identical scene.
+        let damage = self.render_damage.take().or_else(|| {
+            self.platform_window
+                .wants_render_damage()
+                .then_some(crate::SceneDamage::Unchanged)
+        });
+        self.platform_window
+            .draw_with_damage(&self.rendered_frame.scene, damage);
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
         self.needs_present.set(false);
