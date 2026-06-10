@@ -2,8 +2,8 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, SceneDamage, Shadow, Size,
+    SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -66,65 +66,21 @@ struct PathSprite {
 /// main pass.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Returns the quads eligible for the opaque depth pre-pass, sorted front-to-back.
-fn collect_opaque_quads(scene: &Scene) -> Vec<Quad> {
-    let mut quads: Vec<Quad> = scene
-        .quads
-        .iter()
-        .filter(|quad| is_opaque_quad(quad))
-        .copied()
-        .collect();
-    quads.sort_by_key(|quad| std::cmp::Reverse(quad.order));
-    quads
-}
-
-/// A quad qualifies for the depth pre-pass only if it covers its rect with fully
-/// opaque pixels and isn't clipped (the pre-pass has no fragment shader to clip
-/// or antialias).
-fn is_opaque_quad(quad: &Quad) -> bool {
-    let solid_opaque = quad
-        .background
-        .as_solid()
-        .is_some_and(|color| color.is_opaque());
-    if !solid_opaque {
-        return false;
+/// Converts a damage rect (in scaled/device pixels) into an integer scissor
+/// rect clamped to the surface, or `None` if it's empty.
+fn rect_to_scissor(
+    rect: Bounds<ScaledPixels>,
+    width: u32,
+    height: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let x0 = (rect.origin.x.0.floor().max(0.0) as u32).min(width);
+    let y0 = (rect.origin.y.0.floor().max(0.0) as u32).min(height);
+    let x1 = ((rect.origin.x.0 + rect.size.width.0).ceil().max(0.0) as u32).min(width);
+    let y1 = ((rect.origin.y.0 + rect.size.height.0).ceil().max(0.0) as u32).min(height);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
     }
-
-    let unrounded = quad.corner_radii.top_left.0 == 0.0
-        && quad.corner_radii.top_right.0 == 0.0
-        && quad.corner_radii.bottom_left.0 == 0.0
-        && quad.corner_radii.bottom_right.0 == 0.0;
-    let unbordered = quad.border_widths.top.0 == 0.0
-        && quad.border_widths.right.0 == 0.0
-        && quad.border_widths.bottom.0 == 0.0
-        && quad.border_widths.left.0 == 0.0;
-
-    let mask = quad.content_mask.bounds;
-    let bounds = quad.bounds;
-    let unclipped = mask.origin.x.0 <= bounds.origin.x.0
-        && mask.origin.y.0 <= bounds.origin.y.0
-        && mask.origin.x.0 + mask.size.width.0 >= bounds.origin.x.0 + bounds.size.width.0
-        && mask.origin.y.0 + mask.size.height.0 >= bounds.origin.y.0 + bounds.size.height.0;
-
-    unrounded && unbordered && unclipped
-}
-
-/// The highest draw order in the scene. Primitive vectors are sorted by order in
-/// `Scene::finish`, so each type's maximum is its last element.
-fn scene_max_order(scene: &Scene) -> u32 {
-    [
-        scene.quads.last().map(|p| p.order),
-        scene.shadows.last().map(|p| p.order),
-        scene.paths.last().map(|p| p.order),
-        scene.underlines.last().map(|p| p.order),
-        scene.monochrome_sprites.last().map(|p| p.order),
-        scene.subpixel_sprites.last().map(|p| p.order),
-        scene.polychrome_sprites.last().map(|p| p.order),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
-    .unwrap_or(0)
+    Some((x0, y0, x1 - x0, y1 - y0))
 }
 
 #[derive(Clone, Debug)]
@@ -150,8 +106,9 @@ pub struct WgpuSurfaceConfig {
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
-    /// Depth-only pipeline that writes the opaque depth pre-pass.
-    opaque_quads: wgpu::RenderPipeline,
+    /// Depth-only pipeline that writes the opaque depth pre-pass. `None` when the
+    /// pre-pass is disabled.
+    opaque_quads: Option<wgpu::RenderPipeline>,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
@@ -190,6 +147,9 @@ struct WgpuResources {
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
     depth_texture: Option<wgpu::Texture>,
+    /// Persistent render target for damage tracking. Holds the last complete
+    /// frame so partial frames can `Load` it reliably (unlike the swapchain).
+    accum_texture: Option<wgpu::Texture>,
 }
 
 impl WgpuResources {
@@ -199,6 +159,7 @@ impl WgpuResources {
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
         self.depth_texture = None;
+        self.accum_texture = None;
     }
 }
 
@@ -229,6 +190,17 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// When set (via `GPUI_DAMAGE`), only the changed region is redrawn each
+    /// frame into a persistent target, which is then copied to the swapchain.
+    damage_enabled: bool,
+    /// When set (via `GPUI_DEPTH_PREPASS`), opaque quads are drawn into a
+    /// depth-only pre-pass so occluded fragments are rejected instead of
+    /// overdrawn. The depth machinery is inert when disabled.
+    depth_prepass_enabled: bool,
+    /// Damage accumulated since the last successful present. Frames whose
+    /// presentation fails or is skipped keep contributing here so no change is
+    /// lost before it reaches the screen.
+    pending_damage: SceneDamage,
 }
 
 impl WgpuRenderer {
@@ -401,8 +373,27 @@ impl WgpuRenderer {
             );
         }
 
+        // Damage tracking (opt-in via GPUI_DAMAGE) renders partial frames into a
+        // persistent target and copies the whole thing to the swapchain, which
+        // requires the surface to support being a copy destination.
+        let damage_requested = std::env::var("GPUI_DAMAGE").is_ok();
+        let surface_supports_copy_dst = surface_caps.usages.contains(wgpu::TextureUsages::COPY_DST);
+        let damage_enabled = damage_requested && surface_supports_copy_dst;
+        // When disabled, no depth texture/attachment/pipeline-state is created, so
+        // the renderer is bit-for-bit the legacy painter's-algorithm path.
+        let depth_prepass_enabled = std::env::var("GPUI_DEPTH_PREPASS").is_ok();
+        if damage_requested && !surface_supports_copy_dst {
+            warn!(
+                "GPUI_DAMAGE requested but the surface does not support COPY_DST; damage tracking disabled"
+            );
+        }
+
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if damage_enabled {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -430,6 +421,7 @@ impl WgpuRenderer {
             alpha_mode,
             rendering_params.path_sample_count,
             dual_source_blending,
+            depth_prepass_enabled,
         );
 
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -535,6 +527,7 @@ impl WgpuRenderer {
             path_msaa_texture: None,
             path_msaa_view: None,
             depth_texture: None,
+            accum_texture: None,
         };
 
         Ok(Self {
@@ -560,6 +553,9 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            damage_enabled,
+            depth_prepass_enabled,
+            pending_damage: SceneDamage::Full,
         })
     }
 
@@ -694,6 +690,7 @@ impl WgpuRenderer {
         alpha_mode: wgpu::CompositeAlphaMode,
         path_sample_count: u32,
         dual_source_blending: bool,
+        depth_prepass: bool,
     ) -> WgpuPipelines {
         // Diagnostic guard: verify the device actually has
         // DUAL_SOURCE_BLENDING. We have a crash report (ZED-5G1) where a
@@ -750,14 +747,16 @@ impl WgpuRenderer {
         };
 
         // Main-pass primitives test (but never write) depth so fragments hidden
-        // behind opaque quads from the depth pre-pass are rejected early.
-        let depth_test = wgpu::DepthStencilState {
+        // behind opaque quads from the depth pre-pass are rejected early. When the
+        // pre-pass is disabled there is no depth attachment, so pipelines must
+        // declare no depth state.
+        let depth_test = depth_prepass.then(|| wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::LessEqual),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
-        };
+        });
 
         let create_pipeline =
             |name: &str,
@@ -822,13 +821,13 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
-            Some(depth_test.clone()),
+            depth_test.clone(),
         );
 
         // Depth-only pre-pass: fully-opaque, unrounded, unbordered, unclipped
         // quads write depth (front-to-back) so the main pass can reject hidden
-        // fragments. No color output.
-        let opaque_quads = {
+        // fragments. No color output. Only built when the pre-pass is enabled.
+        let opaque_quads = depth_prepass.then(|| {
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("opaque_quads_layout"),
                 bind_group_layouts: &[Some(&layouts.globals), Some(&layouts.instances)],
@@ -879,7 +878,7 @@ impl WgpuRenderer {
                 multiview_mask: None,
                 cache: None,
             })
-        };
+        });
 
         let shadows = create_pipeline(
             "shadows",
@@ -891,7 +890,7 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
-            Some(depth_test.clone()),
+            depth_test.clone(),
         );
 
         let path_rasterization = create_pipeline(
@@ -938,7 +937,7 @@ impl WgpuRenderer {
             })],
             1,
             &shader_module,
-            Some(depth_test.clone()),
+            depth_test.clone(),
         );
 
         let underlines = create_pipeline(
@@ -951,7 +950,7 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
-            Some(depth_test.clone()),
+            depth_test.clone(),
         );
 
         let mono_sprites = create_pipeline(
@@ -964,7 +963,7 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
-            Some(depth_test.clone()),
+            depth_test.clone(),
         );
 
         let subpixel_sprites = if let Some(subpixel_module) = &subpixel_shader_module {
@@ -995,7 +994,7 @@ impl WgpuRenderer {
                 })],
                 1,
                 subpixel_module,
-                Some(depth_test.clone()),
+                depth_test.clone(),
             ))
         } else {
             None
@@ -1011,7 +1010,7 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
             &shader_module,
-            Some(depth_test.clone()),
+            depth_test.clone(),
         );
 
         let surfaces = create_pipeline(
@@ -1024,7 +1023,7 @@ impl WgpuRenderer {
             &[Some(color_target)],
             1,
             &shader_module,
-            Some(depth_test),
+            depth_test,
         );
 
         WgpuPipelines {
@@ -1110,11 +1109,19 @@ impl WgpuRenderer {
         Some((texture, view))
     }
 
+    /// Forces full redraws for the next few frames and drops the damage
+    /// baseline. Call whenever the swapchain buffers become stale (resize,
+    /// reconfigure, device recovery).
+    fn invalidate_damage_state(&mut self) {
+        self.pending_damage = SceneDamage::Full;
+    }
+
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
 
         if width != self.surface_config.width || height != self.surface_config.height {
+            self.invalidate_damage_state();
             let clamped_width = width.min(self.max_texture_size);
             let clamped_height = height.min(self.max_texture_size);
 
@@ -1148,6 +1155,9 @@ impl WgpuRenderer {
                 texture.destroy();
             }
             if let Some(ref texture) = resources.depth_texture {
+                texture.destroy();
+            }
+            if let Some(ref texture) = resources.accum_texture {
                 texture.destroy();
             }
 
@@ -1189,8 +1199,30 @@ impl WgpuRenderer {
         resources.path_msaa_texture = path_msaa_texture;
         resources.path_msaa_view = path_msaa_view;
 
-        let depth_texture = Self::create_depth_texture(&resources.device, width, height);
-        resources.depth_texture = Some(depth_texture);
+        if self.depth_prepass_enabled {
+            let resources = self.resources_mut();
+            let depth_texture = Self::create_depth_texture(&resources.device, width, height);
+            resources.depth_texture = Some(depth_texture);
+        }
+
+        if self.damage_enabled {
+            let resources = self.resources_mut();
+            let accum = resources.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("damage_accum"),
+                size: wgpu::Extent3d {
+                    width: width.max(1),
+                    height: height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            resources.accum_texture = Some(accum);
+        }
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1205,10 +1237,12 @@ impl WgpuRenderer {
         };
 
         if new_alpha_mode != self.surface_config.alpha_mode {
+            self.invalidate_damage_state();
             self.surface_config.alpha_mode = new_alpha_mode;
             let surface_config = self.surface_config.clone();
             let path_sample_count = self.rendering_params.path_sample_count;
             let dual_source_blending = self.dual_source_blending;
+            let depth_prepass_enabled = self.depth_prepass_enabled;
             let resources = self.resources_mut();
             resources
                 .surface
@@ -1220,6 +1254,7 @@ impl WgpuRenderer {
                 surface_config.alpha_mode,
                 path_sample_count,
                 dual_source_blending,
+                depth_prepass_enabled,
             );
         }
     }
@@ -1253,7 +1288,27 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    /// Whether this renderer consumes per-frame damage regions (GPUI_DAMAGE).
+    pub fn damage_enabled(&self) -> bool {
+        self.damage_enabled
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        self.draw_with_damage(scene, None)
+    }
+
+    pub fn draw_with_damage(&mut self, scene: &Scene, damage: Option<SceneDamage>) -> bool {
+        // Accumulate this frame's damage before any early return: the window's
+        // frame state advances regardless of whether we manage to present, so a
+        // dropped frame's damage must persist until it reaches the screen.
+        // `None` means damage wasn't computed and we must redraw in full.
+        let incoming = if self.damage_enabled {
+            damage.unwrap_or(SceneDamage::Full)
+        } else {
+            SceneDamage::Full
+        };
+        self.pending_damage = self.pending_damage.union(incoming);
+
         // Bail out early if the surface has been unconfigured (e.g. during
         // Android background/rotation transitions).  Attempting to acquire
         // a texture from an unconfigured surface can block indefinitely on
@@ -1280,11 +1335,47 @@ impl WgpuRenderer {
                 self.atlas.clear();
                 self.needs_redraw = true;
                 self.failed_frame_count = 0;
+                self.invalidate_damage_state();
                 return false;
             }
         } else {
             self.failed_frame_count = 0;
         }
+
+        if matches!(self.pending_damage, SceneDamage::Unchanged) {
+            // Pixel-identical to the last presented frame; don't present. Returning
+            // false lets the platform commit the surface so the frame-callback
+            // loop keeps running (otherwise rendering stalls on Wayland).
+            return false;
+        }
+
+        let surface_width = self.surface_config.width;
+        let surface_height = self.surface_config.height;
+        let frame_rect = match &self.pending_damage {
+            SceneDamage::Rect(rect) => *rect,
+            _ => Bounds {
+                origin: Point {
+                    x: ScaledPixels(0.0),
+                    y: ScaledPixels(0.0),
+                },
+                size: Size {
+                    width: ScaledPixels(surface_width as f32),
+                    height: ScaledPixels(surface_height as f32),
+                },
+            },
+        };
+
+        // Clamp the damaged region to an integer scissor rect. A partial frame
+        // loads the persistent target (which reliably holds the previous frame)
+        // and redraws only this region; a full frame clears and redraws all.
+        let (color_load, scissor) = match rect_to_scissor(frame_rect, surface_width, surface_height)
+        {
+            None => return false,
+            Some(sc) if sc == (0, 0, surface_width, surface_height) => {
+                (wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), None)
+            }
+            Some(sc) => (wgpu::LoadOp::Load, Some(sc)),
+        };
 
         self.atlas.before_frame();
 
@@ -1298,6 +1389,7 @@ impl WgpuRenderer {
                 resources
                     .surface
                     .configure(&resources.device, &surface_config);
+                self.invalidate_damage_state();
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
@@ -1306,6 +1398,7 @@ impl WgpuRenderer {
                 resources
                     .surface
                     .configure(&resources.device, &surface_config);
+                self.invalidate_damage_state();
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -1333,9 +1426,16 @@ impl WgpuRenderer {
             _pad: 0,
         };
 
-        // Quads eligible for the opaque depth pre-pass, sorted front-to-back so
-        // hidden fragments are rejected by the depth test instead of overdrawn.
-        let opaque_quads = collect_opaque_quads(scene);
+        // Quads eligible for the opaque depth pre-pass, front-to-back so hidden
+        // fragments are rejected by the depth test instead of overdrawn.
+        // `scene.opaque_quads()` yields ascending order; reverse for front-to-back.
+        // An empty list skips the pre-pass entirely, leaving the depth machinery
+        // inert (the depth buffer stays cleared, so every fragment passes).
+        let opaque_quads: Vec<Quad> = if self.depth_prepass_enabled {
+            scene.opaque_quads().rev().copied().collect()
+        } else {
+            Vec::new()
+        };
 
         let globals = GlobalParams {
             viewport_size: [
@@ -1349,7 +1449,7 @@ impl WgpuRenderer {
             } else {
                 0
             },
-            max_order: scene_max_order(scene) as f32,
+            max_order: scene.max_order() as f32,
         };
 
         let path_globals = GlobalParams {
@@ -1376,12 +1476,38 @@ impl WgpuRenderer {
             );
         }
 
+        // Only attached when the opaque depth pre-pass is enabled; otherwise the
+        // render passes carry no depth attachment (legacy painter's algorithm).
         let depth_view = self
             .resources()
             .depth_texture
             .as_ref()
-            .expect("depth texture not available")
-            .create_view(&wgpu::TextureViewDescriptor::default());
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
+        let depth_attachment = |load: wgpu::LoadOp<f32>| {
+            depth_view
+                .as_ref()
+                .map(|view| wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: Some(wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                })
+        };
+
+        // When damage tracking is on, render into the persistent target and copy
+        // it to the swapchain afterwards; otherwise render straight to the frame.
+        let accum_view = self
+            .resources()
+            .accum_texture
+            .as_ref()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
+        let target_view = if self.damage_enabled {
+            accum_view.as_ref().unwrap_or(&frame_view)
+        } else {
+            &frame_view
+        };
 
         loop {
             let mut instance_offset: u64 = 0;
@@ -1398,36 +1524,35 @@ impl WgpuRenderer {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
+                        view: target_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            load: color_load,
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
                     })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &depth_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
+                    depth_stencil_attachment: depth_attachment(wgpu::LoadOp::Clear(1.0)),
                     ..Default::default()
                 });
 
+                if let Some((x, y, w, h)) = scissor {
+                    pass.set_scissor_rect(x, y, w, h);
+                }
+
                 // Opaque depth pre-pass: write depth for opaque quads only.
-                if !opaque_quads.is_empty()
-                    && !self.draw_instances(
-                        unsafe { Self::instance_bytes(&opaque_quads) },
-                        opaque_quads.len() as u32,
-                        &self.resources().pipelines.opaque_quads,
-                        &mut instance_offset,
-                        &mut pass,
-                    )
-                {
-                    overflow = true;
+                if let Some(opaque_pipeline) = self.resources().pipelines.opaque_quads.as_ref() {
+                    if !opaque_quads.is_empty()
+                        && !self.draw_instances(
+                            unsafe { Self::instance_bytes(&opaque_quads) },
+                            opaque_quads.len() as u32,
+                            opaque_pipeline,
+                            &mut instance_offset,
+                            &mut pass,
+                        )
+                    {
+                        overflow = true;
+                    }
                 }
 
                 for batch in scene.batches() {
@@ -1460,7 +1585,7 @@ impl WgpuRenderer {
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &frame_view,
+                                    view: target_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
                                         load: wgpu::LoadOp::Load,
@@ -1468,18 +1593,13 @@ impl WgpuRenderer {
                                     },
                                     depth_slice: None,
                                 })],
-                                depth_stencil_attachment: Some(
-                                    wgpu::RenderPassDepthStencilAttachment {
-                                        view: &depth_view,
-                                        depth_ops: Some(wgpu::Operations {
-                                            load: wgpu::LoadOp::Load,
-                                            store: wgpu::StoreOp::Store,
-                                        }),
-                                        stencil_ops: None,
-                                    },
-                                ),
+                                depth_stencil_attachment: depth_attachment(wgpu::LoadOp::Load),
                                 ..Default::default()
                             });
+
+                            if let Some((x, y, w, h)) = scissor {
+                                pass.set_scissor_rect(x, y, w, h);
+                            }
 
                             if did_draw {
                                 self.draw_paths_from_intermediate(
@@ -1544,10 +1664,54 @@ impl WgpuRenderer {
                 continue;
             }
 
+            // Copy the persistent target onto the swapchain image. This fully
+            // refreshes the swapchain (whose contents aren't preserved across
+            // present), so partial redraws into the target remain correct.
+            if self.damage_enabled {
+                if let Some(accum) = self.resources().accum_texture.as_ref() {
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: accum,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &frame.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: surface_width,
+                            height: surface_height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+            }
+
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
-            frame.present();
+
+            // Pass the damaged region to the compositor (VK_KHR_incremental_present /
+            // EGL swap-with-damage) so it only recomposites what changed. An empty
+            // damage list means "everything changed".
+            match scissor {
+                Some((x, y, w, h)) if self.damage_enabled => {
+                    frame.present_with_damage(&[wgpu::DamageRect {
+                        x: x as i32,
+                        y: y as i32,
+                        width: w,
+                        height: h,
+                    }]);
+                }
+                _ => frame.present(),
+            }
+
+            self.pending_damage = SceneDamage::Unchanged;
+
             return true;
         }
     }
@@ -1918,6 +2082,7 @@ impl WgpuRenderer {
     /// surface later without losing cached atlas textures.
     pub fn unconfigure_surface(&mut self) {
         self.surface_configured = false;
+        self.invalidate_damage_state();
         // Drop intermediate textures since they reference the old surface size.
         if let Some(res) = self.resources.as_mut() {
             res.invalidate_intermediate_textures();
@@ -1974,6 +2139,7 @@ impl WgpuRenderer {
         }
 
         self.surface_configured = true;
+        self.invalidate_damage_state();
 
         Ok(())
     }
