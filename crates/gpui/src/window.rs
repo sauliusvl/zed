@@ -2744,6 +2744,12 @@ impl Window {
         let mut views = self.invalidator.take_views();
         for entity in views.drain() {
             self.mark_view_dirty(entity);
+            // Also record non-view entities (e.g. a `Markdown` entity rendered by an
+            // element inside a cached view), so that cached views which read them
+            // during their last render can detect the change and re-render instead
+            // of reusing a stale frame. Inserted after `mark_view_dirty`, which
+            // relies on insertion failure to stop its ancestor walk early.
+            self.dirty_views.insert(entity);
         }
         self.invalidator.replace_views(views);
     }
