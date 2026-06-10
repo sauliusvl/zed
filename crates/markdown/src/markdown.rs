@@ -1035,7 +1035,6 @@ impl Markdown {
                     this.parse(cx);
                 }
                 cx.notify();
-                cx.refresh_windows();
             })
             .ok();
         })
