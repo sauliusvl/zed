@@ -892,6 +892,10 @@ features = [
     "Win32_Media",
 ]
 
+# Try out wgpu damage-aware presentation (https://github.com/zed-industries/wgpu/pull/2)
+[patch.'https://github.com/zed-industries/wgpu.git']
+wgpu = { git = "https://github.com/loadingalias/wgpu.git", rev = "bb070fec2ca45625855581ba894a6cb0b55e2105" }
+
 [patch.crates-io]
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
