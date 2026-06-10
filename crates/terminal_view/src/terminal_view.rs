@@ -22,6 +22,7 @@ use serde::Deserialize;
 use settings::{
     SeedQuerySetting, Settings, SettingsStore, TerminalBell, TerminalBlink, WorkingDirectory,
 };
+use std::cell::RefCell;
 use std::{
     any::Any,
     cmp,
@@ -38,7 +39,7 @@ use terminal::{
     Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal, TerminalBounds, ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
 };
-use terminal_element::TerminalElement;
+use terminal_element::{GridLayoutCache, TerminalElement};
 use terminal_panel::TerminalPanel;
 use terminal_path_like_target::{hover_path_like_target, open_path_like_target};
 use terminal_scrollbar::TerminalScrollHandle;
@@ -152,6 +153,9 @@ pub struct TerminalView {
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
+    /// Cached, laid-out terminal grid, reused across re-prepaints when the grid
+    /// content and styling are unchanged. See [`GridLayoutCache`].
+    grid_layout_cache: RefCell<Option<GridLayoutCache>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -298,6 +302,7 @@ impl TerminalView {
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
+            grid_layout_cache: RefCell::new(None),
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }

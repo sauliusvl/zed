@@ -13,8 +13,8 @@ use language::CursorShape as EditorCursorShape;
 use settings::Settings;
 use std::time::Instant;
 use terminal::{
-    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, Terminal,
-    TerminalBounds, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
+    Cell, Color, Content, CursorShape, HoveredWord, IndexedCell, Modes, NamedColor, Point, Range,
+    Terminal, TerminalBounds, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
     is_default_background_color, terminal_settings::TerminalSettings,
 };
 use theme::{ActiveTheme, Theme};
@@ -25,6 +25,7 @@ use util::ResultExt;
 use workspace::Workspace;
 
 use std::mem;
+use std::sync::Arc;
 use std::{fmt::Debug, rc::Rc};
 
 use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
@@ -32,8 +33,8 @@ use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalVi
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
     hitbox: Hitbox,
-    batched_text_runs: Vec<BatchedTextRun>,
-    rects: Vec<LayoutRect>,
+    batched_text_runs: Rc<Vec<BatchedTextRun>>,
+    rects: Rc<Vec<LayoutRect>>,
     relative_highlighted_ranges: Vec<(Range, Hsla)>,
     cursor: Option<CursorLayout>,
     ime_cursor_bounds: Option<Bounds<Pixels>>,
@@ -45,6 +46,29 @@ pub struct LayoutState {
     block_below_cursor_element: Option<AnyElement>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
+}
+
+/// Inputs that determine the output of `layout_grid`. When unchanged between
+/// frames the laid-out cells can be reused, avoiding redundant per-cell work
+/// when the element is re-prepainted (e.g. on pointer movement over the
+/// terminal, which notifies the terminal entity even when nothing changed).
+#[derive(PartialEq)]
+pub(crate) struct GridLayoutKey {
+    content_version: u64,
+    text_style: TextStyle,
+    hovered_word: Option<HoveredWord>,
+    minimum_contrast_bits: u32,
+    theme: usize,
+    start_line_offset: i32,
+    visible_row_count: Option<usize>,
+}
+
+/// Cached `layout_grid` output keyed by [`GridLayoutKey`]. Stored on
+/// [`TerminalView`] since the element itself is recreated every frame.
+pub(crate) struct GridLayoutCache {
+    key: GridLayoutKey,
+    rects: Rc<Vec<LayoutRect>>,
+    runs: Rc<Vec<BatchedTextRun>>,
 }
 
 /// Helper struct for converting terminal cursor points to displayed cursor points.
@@ -1158,54 +1182,96 @@ impl Element for TerminalElement {
                 // This handles the case where the terminal has been scrolled past (above or
                 // below the viewport), similar to the editor fix in PR #45077 where start_row
                 // could exceed max_row when the editor was positioned above the viewport.
-                let (rects, batched_text_runs) = if intersection.size.height <= px(0.)
-                    || intersection.size.width <= px(0.)
-                {
-                    (Vec::new(), Vec::new())
-                } else if intersection == content_bounds {
-                    // Fast path: terminal fully visible, no clipping needed.
-                    // Avoid grouping/allocation overhead by streaming cells directly.
-                    TerminalElement::layout_grid(
-                        cells.iter(),
-                        0,
-                        &text_style,
-                        last_hovered_word
-                            .as_ref()
-                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
-                        minimum_contrast,
-                        cx,
-                    )
+                let empty = intersection.size.height <= px(0.) || intersection.size.width <= px(0.);
+                let fully_visible = intersection == content_bounds;
+                // Calculate which screen rows are visible based on pixel positions.
+                // This works for both Scrollable and Inline modes because we filter
+                // by screen position (enumerated line group index), not by the cell's
+                // internal line number (which can be negative in Scrollable mode for
+                // scrollback history).
+                let (start_line_offset, visible_row_count) = if empty {
+                    (0, Some(0))
+                } else if fully_visible {
+                    (0, None)
                 } else {
-                    // Calculate which screen rows are visible based on pixel positions.
-                    // This works for both Scrollable and Inline modes because we filter
-                    // by screen position (enumerated line group index), not by the cell's
-                    // internal line number (which can be negative in Scrollable mode for
-                    // scrollback history).
                     let rows_above_viewport = f32::from(
                         (intersection.top() - content_bounds.top()).max(px(0.)) / line_height_px,
                     ) as usize;
                     let visible_row_count =
                         f32::from((intersection.size.height / line_height_px).ceil()) as usize + 1;
+                    (rows_above_viewport as i32, Some(visible_row_count))
+                };
 
-                    TerminalElement::layout_grid(
-                        // Group cells by line and filter to only the visible screen rows.
-                        // skip() and take() work on enumerated line groups (screen position),
-                        // making this work regardless of the actual cell.point.line values.
-                        cells
-                            .iter()
-                            .chunk_by(|c| c.point.line)
-                            .into_iter()
-                            .skip(rows_above_viewport)
-                            .take(visible_row_count)
-                            .flat_map(|(_, line_cells)| line_cells),
-                        rows_above_viewport as i32,
-                        &text_style,
-                        last_hovered_word
-                            .as_ref()
-                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
-                        minimum_contrast,
-                        cx,
-                    )
+                // Reuse the previously laid-out grid when nothing that affects it
+                // changed. The terminal entity is notified on every pointer move
+                // over it, so without this the per-cell `layout_grid` work would
+                // run on every frame even for an idle terminal.
+                let layout_key = GridLayoutKey {
+                    content_version: self.terminal.read(cx).content_version(),
+                    text_style: text_style.clone(),
+                    hovered_word: last_hovered_word.clone(),
+                    minimum_contrast_bits: minimum_contrast.to_bits(),
+                    theme: Arc::as_ptr(&theme) as *const Theme as usize,
+                    start_line_offset,
+                    visible_row_count,
+                };
+
+                let cached = self
+                    .terminal_view
+                    .read(cx)
+                    .grid_layout_cache
+                    .borrow()
+                    .as_ref()
+                    .filter(|cache| cache.key == layout_key)
+                    .map(|cache| (cache.rects.clone(), cache.runs.clone()));
+
+                let (rects, batched_text_runs) = if let Some(cached) = cached {
+                    cached
+                } else {
+                    let hyperlink = last_hovered_word
+                        .as_ref()
+                        .map(|last_hovered_word| (link_style, &last_hovered_word.word_match));
+                    let (rects, batched_text_runs) = if empty {
+                        (Vec::new(), Vec::new())
+                    } else if fully_visible {
+                        // Fast path: terminal fully visible, no clipping needed.
+                        // Avoid grouping/allocation overhead by streaming cells directly.
+                        TerminalElement::layout_grid(
+                            cells.iter(),
+                            0,
+                            &text_style,
+                            hyperlink,
+                            minimum_contrast,
+                            cx,
+                        )
+                    } else {
+                        TerminalElement::layout_grid(
+                            // Group cells by line and filter to only the visible screen rows.
+                            // skip() and take() work on enumerated line groups (screen position),
+                            // making this work regardless of the actual cell.point.line values.
+                            cells
+                                .iter()
+                                .chunk_by(|c| c.point.line)
+                                .into_iter()
+                                .skip(start_line_offset as usize)
+                                .take(visible_row_count.unwrap_or(0))
+                                .flat_map(|(_, line_cells)| line_cells),
+                            start_line_offset,
+                            &text_style,
+                            hyperlink,
+                            minimum_contrast,
+                            cx,
+                        )
+                    };
+                    let rects = Rc::new(rects);
+                    let batched_text_runs = Rc::new(batched_text_runs);
+                    *self.terminal_view.read(cx).grid_layout_cache.borrow_mut() =
+                        Some(GridLayoutCache {
+                            key: layout_key,
+                            rects: rects.clone(),
+                            runs: batched_text_runs.clone(),
+                        });
+                    (rects, batched_text_runs)
                 };
 
                 // Layout cursor. Rectangle is used for IME, so we should lay it out even
@@ -1396,7 +1462,7 @@ impl Element for TerminalElement {
                         }
                     });
 
-                    for rect in &layout.rects {
+                    for rect in layout.rects.iter() {
                         rect.paint(origin, &layout.dimensions, window);
                     }
 
@@ -1423,7 +1489,7 @@ impl Element for TerminalElement {
 
                     // Paint batched text runs instead of individual cells
                     let text_paint_start = Instant::now();
-                    for batch in &layout.batched_text_runs {
+                    for batch in layout.batched_text_runs.iter() {
                         batch.paint(origin, &layout.dimensions, window, cx);
                     }
                     let text_paint_time = text_paint_start.elapsed();

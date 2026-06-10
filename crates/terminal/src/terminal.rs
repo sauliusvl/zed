@@ -906,6 +906,8 @@ impl TerminalBuilder {
                 terminal_bounds,
                 ..Default::default()
             },
+            content_dirty: true,
+            content_version: 0,
             last_mouse: None,
             matches: Vec::new(),
 
@@ -1126,6 +1128,8 @@ impl TerminalBuilder {
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
+                content_dirty: true,
+                content_version: 0,
                 last_mouse: None,
                 matches: Vec::new(),
 
@@ -1297,6 +1301,13 @@ pub struct Terminal {
     last_mouse: Option<(Point, SelectionSide)>,
     pub matches: Vec<Range>,
     pub last_content: Content,
+    /// Set whenever the terminal grid may have changed since the last `sync`,
+    /// so `sync` can skip rebuilding `last_content` when nothing changed (e.g.
+    /// when the element is re-laid-out only because the pointer moved elsewhere).
+    content_dirty: bool,
+    /// Bumped every time `last_content` is rebuilt, so renderers can cheaply
+    /// detect whether the grid changed without comparing cell contents.
+    content_version: u64,
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
@@ -1378,6 +1389,10 @@ impl Terminal {
     }
 
     fn process_event(&mut self, event: TerminalBackendEvent, cx: &mut Context<Self>) {
+        // Backend events can mutate the grid (e.g. `Wakeup` after the background
+        // event loop advances it, or writes triggered by clipboard/color requests).
+        // Marking dirty here is conservative: harmless for non-grid events.
+        self.content_dirty = true;
         match event {
             TerminalBackendEvent::Title(title) => {
                 // ignore default shell program title change as windows always sends those events
@@ -1714,6 +1729,8 @@ impl Terminal {
 
         let mut term = self.term.lock();
         self.output_processor.advance(&mut *term, &converted);
+        drop(term);
+        self.content_dirty = true;
         cx.emit(Event::Wakeup);
     }
 
@@ -2021,10 +2038,23 @@ impl Terminal {
         let mut terminal = term.lock_unfair();
         //Note that the ordering of events matters for event processing
         while let Some(e) = self.events.pop_front() {
+            self.content_dirty = true;
             self.process_terminal_event(&e, &mut terminal, window, cx)
         }
 
-        self.last_content = make_content(&terminal, &self.last_content);
+        // Only rebuild the renderable content when the grid may have changed.
+        // Re-layouts caused solely by unrelated window activity (e.g. pointer
+        // movement over another panel) reuse the previous content.
+        if std::mem::take(&mut self.content_dirty) {
+            self.last_content = make_content(&terminal, &self.last_content);
+            self.content_version = self.content_version.wrapping_add(1);
+        }
+    }
+
+    /// A monotonically increasing version that changes whenever `last_content`
+    /// is rebuilt. Used to invalidate cached layout derived from the grid.
+    pub fn content_version(&self) -> u64 {
+        self.content_version
     }
 
     pub fn with_renderable_cells<R>(&self, f: impl for<'a> FnOnce(RenderableCells<'a>) -> R) -> R {
@@ -2608,6 +2638,7 @@ impl Terminal {
             // when Zed task finishes and no more output is made.
             // After the task summary is output once, no more text is appended to the terminal.
             unsafe { append_text_to_term(&mut self.term.lock(), &lines_to_show) };
+            self.content_dirty = true;
         }
 
         match hide {
