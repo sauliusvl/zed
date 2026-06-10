@@ -589,7 +589,7 @@ fn show_hover(
                 });
             }
 
-            this.update_in(cx, |editor, window, cx| {
+            this.update(cx, |editor, cx| {
                 if hover_highlights.is_empty() {
                     editor.clear_background_highlights(HighlightKey::HoverState, cx);
                 } else {
@@ -604,7 +604,6 @@ fn show_hover(
 
                 editor.hover_state.info_popovers = info_popovers;
                 cx.notify();
-                window.refresh();
             })?;
 
             anyhow::Ok(())
