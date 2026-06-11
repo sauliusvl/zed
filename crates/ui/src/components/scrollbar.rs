@@ -630,6 +630,11 @@ struct ScrollbarState<T: ScrollableHandle = ScrollHandle> {
     style: ScrollbarStyle,
     mouse_in_parent: bool,
     last_prepaint_state: Option<ScrollbarPrepaintState>,
+    /// The scroll offset observed on the previous prepaint. Used to reveal the
+    /// scrollbars on actual user scrolling. Unlike the thumb geometry, the scroll
+    /// offset is invariant to the scrollbar's own show/hide animation reserving
+    /// space, so comparing it avoids a self-triggering redraw loop.
+    last_offset: Option<Point<Pixels>>,
     _auto_hide_task: Option<Task<()>>,
 }
 
@@ -657,6 +662,7 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
             show_state: VisibilityState::from_behavior(show_behavior),
             mouse_in_parent: true,
             last_prepaint_state: None,
+            last_offset: None,
             _auto_hide_task: None,
         }
     }
@@ -1245,12 +1251,24 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                     },
                     parent_bounds_hitbox: window.insert_hitbox(bounds, HitboxBehavior::Normal),
                 });
-        if prepaint_state
-            .as_ref()
-            .is_some_and(|state| Some(state) != self.state.read(cx).last_prepaint_state.as_ref())
-        {
-            self.state
-                .update(cx, |state, cx| state.show_scrollbars(window, cx));
+        // Reveal the scrollbars when the user actually scrolls. Compare the
+        // scroll offset rather than the rendered thumb geometry: the thumb
+        // geometry also changes when the scrollbar's own show/hide animation
+        // reserves space and reflows content, which would re-trigger the
+        // animation every frame and spin a permanent redraw loop even while idle.
+        if prepaint_state.is_some() {
+            let offset = self.state.read(cx).scroll_handle().offset();
+            let scrolled = self
+                .state
+                .read(cx)
+                .last_offset
+                .is_some_and(|last| last != offset);
+            self.state.update(cx, |state, cx| {
+                state.last_offset = Some(offset);
+                if scrolled {
+                    state.show_scrollbars(window, cx);
+                }
+            });
         }
 
         prepaint_state.map(|state| {
