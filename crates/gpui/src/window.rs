@@ -2656,6 +2656,8 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
+        // Drop primitives hidden behind opaque quads so backends skip them.
+        self.next_frame.scene.cull_occluded();
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
