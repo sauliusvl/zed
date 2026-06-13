@@ -80,7 +80,9 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
-    pad: u32,
+    // Highest draw order in the scene, used to map a primitive's `order` to a
+    // depth value so the opaque depth pre-pass can occlude hidden fragments.
+    max_order: f32,
 }
 
 struct GammaParams {
@@ -170,6 +172,14 @@ struct TransformationMatrix {
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
     let device_position = position / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
     return vec4<f32>(device_position, 0.0, 1.0);
+}
+
+// Maps a primitive draw order to a depth in (0, 1). Higher order (drawn later,
+// i.e. on top) maps to a smaller z, so it is "nearer" under a Less/LessEqual
+// depth test. All real orders land strictly inside (0, 1) so they pass against
+// a depth buffer cleared to 1.0.
+fn order_to_z(order: u32) -> f32 {
+    return 1.0 - (f32(order) + 1.0) / (globals.max_order + 2.0);
 }
 
 fn to_device_position(unit_vertex: vec2<f32>, bounds: Bounds) -> vec4<f32> {
@@ -546,6 +556,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
 
     var out = QuadVarying();
     out.position = to_device_position(unit_vertex, quad.bounds);
+    out.position.z = order_to_z(quad.order);
 
     let gradient = prepare_gradient_color(
         quad.background.tag,
@@ -560,6 +571,14 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.quad_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
     return out;
+}
+
+// Opaque depth pre-pass fragment. Writes no color (the pipeline masks color out)
+// and only exists so the pipeline's color target matches the render pass; depth
+// is written via the depth-stencil state.
+@fragment
+fn fs_quad_depth(input: QuadVarying) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0);
 }
 
 @fragment
@@ -992,6 +1011,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
 
     var out = ShadowVarying();
     out.position = to_device_position(unit_vertex, geometry);
+    out.position.z = order_to_z(shadow.order);
     out.color = hsla_to_rgba(shadow.color);
     out.shadow_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
@@ -1114,6 +1134,8 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
 // --- paths --- //
 
 struct PathSprite {
+    order: u32,
+    pad: u32,
     bounds: Bounds,
 }
 @group(1) @binding(0) var<storage, read> b_path_sprites: array<PathSprite>;
@@ -1135,6 +1157,7 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
 
     var out = PathVarying();
     out.position = device_position;
+    out.position.z = order_to_z(sprite.order);
     out.texture_coords = texture_coords;
 
     return out;
@@ -1174,6 +1197,7 @@ fn vs_underline(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
 
     var out = UnderlineVarying();
     out.position = to_device_position(unit_vertex, underline.bounds);
+    out.position.z = order_to_z(underline.order);
     out.color = hsla_to_rgba(underline.color);
     out.underline_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask);
@@ -1239,6 +1263,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     var out = MonoSpriteVarying();
     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+    out.position.z = order_to_z(sprite.order);
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
@@ -1287,6 +1312,7 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     var out = PolySpriteVarying();
     out.position = to_device_position(unit_vertex, sprite.bounds);
+    out.position.z = order_to_z(sprite.order);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);

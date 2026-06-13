@@ -148,6 +148,34 @@ impl Scene {
         self.surfaces.sort_by_key(|surface| surface.order);
     }
 
+    /// The highest draw order across all primitives, or 0 if the scene is empty.
+    /// A backend maps each primitive's order to a depth relative to this to
+    /// drive an opaque depth pre-pass.
+    pub fn max_order(&self) -> DrawOrder {
+        // Primitive vectors are sorted by order in `finish`, so the max of each
+        // is its last element.
+        [
+            self.quads.last().map(|p| p.order),
+            self.shadows.last().map(|p| p.order),
+            self.paths.last().map(|p| p.order),
+            self.underlines.last().map(|p| p.order),
+            self.monochrome_sprites.last().map(|p| p.order),
+            self.subpixel_sprites.last().map(|p| p.order),
+            self.polychrome_sprites.last().map(|p| p.order),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(0)
+    }
+
+    /// Fully opaque, unrounded, unbordered, unclipped quads, in ascending order.
+    /// These can be drawn into a depth pre-pass to occlude whatever is behind
+    /// them; a back-to-front pass can `.rev()` this.
+    pub fn opaque_quads(&self) -> impl DoubleEndedIterator<Item = &Quad> {
+        self.quads.iter().filter(|quad| is_opaque_quad(quad))
+    }
+
     #[cfg_attr(
         all(
             any(target_os = "linux", target_os = "freebsd"),
@@ -175,6 +203,31 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
         }
     }
+}
+
+/// A quad usable as a depth-pre-pass occluder: a fully opaque solid fill with
+/// no rounding, border, or clipping, so everything behind it is truly hidden.
+fn is_opaque_quad(quad: &Quad) -> bool {
+    let solid_opaque = quad
+        .background
+        .as_solid()
+        .is_some_and(|color| color.is_opaque());
+    let unrounded = quad.corner_radii.top_left.0 == 0.0
+        && quad.corner_radii.top_right.0 == 0.0
+        && quad.corner_radii.bottom_left.0 == 0.0
+        && quad.corner_radii.bottom_right.0 == 0.0;
+    let unbordered = quad.border_widths.top.0 == 0.0
+        && quad.border_widths.right.0 == 0.0
+        && quad.border_widths.bottom.0 == 0.0
+        && quad.border_widths.left.0 == 0.0;
+    let mask = &quad.content_mask.bounds;
+    let unclipped = mask.origin.x.0 <= quad.bounds.origin.x.0
+        && mask.origin.y.0 <= quad.bounds.origin.y.0
+        && mask.origin.x.0 + mask.size.width.0 >= quad.bounds.origin.x.0 + quad.bounds.size.width.0
+        && mask.origin.y.0 + mask.size.height.0
+            >= quad.bounds.origin.y.0 + quad.bounds.size.height.0;
+
+    solid_opaque && unrounded && unbordered && unclipped
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
